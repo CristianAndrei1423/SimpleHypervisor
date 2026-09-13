@@ -1,6 +1,9 @@
 #include <err.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,15 +12,153 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <errno.h>
 #include <termios.h>
-#include <signal.h>
+#include <unistd.h>
+
+/* --- COM1 16550 UART, wired to ISA IRQ 4, single-byte receive --- */
+
+#define COM1_BASE 0x3f8
+#define COM1_IRQ  4
+
+struct uart {
+    pthread_mutex_t lock;
+    int vmfd;
+
+    uint8_t ier;   /* 0x3f9 interrupt enable   */
+    uint8_t lcr;   /* 0x3fb line control (b7=DLAB) */
+    uint8_t mcr;   /* 0x3fc modem control (b3=OUT2) */
+    uint8_t fcr;   /* FIFO control (write of 0x3fa) */
+    uint8_t dll;   /* divisor latch low  (0x3f8, DLAB=1) */
+    uint8_t dlm;   /* divisor latch high (0x3f9, DLAB=1) */
+
+    uint8_t rx_byte;   /* one pending input byte */
+    int rx_ready;      /* is rx_byte valid? */
+
+    int thre_int;      /* TX-holding-empty interrupt latched */
+    int irq_level;     /* last level driven on IRQ 4 */
+};
+
+static struct uart uart;
+
+/* Drive IRQ 4 to match the UART's interrupt state. Call with lock held. */
+static void uart_update_irq(struct uart *u) {
+    int assert = 0;
+    if (u->mcr & 0x08) {                            /* OUT2 gates INTR to the bus */
+        if ((u->ier & 0x01) && u->rx_ready)        assert = 1;  /* RX data ready */
+        else if ((u->ier & 0x02) && u->thre_int)   assert = 1;  /* TX buffer empty */
+    }
+    if (assert != u->irq_level) {
+        u->irq_level = assert;
+        struct kvm_irq_level lvl = { .irq = COM1_IRQ, .level = assert };
+        ioctl(u->vmfd, KVM_IRQ_LINE, &lvl);
+    }
+}
+
+/* Handle one KVM_EXIT_IO to a COM1 register (0x3f8..0x3ff). */
+static void uart_io(struct uart *u, struct kvm_run *run) {
+    uint8_t *data = (uint8_t *)run + run->io.data_offset;
+    int reg  = run->io.port - COM1_BASE;
+    int dlab = u->lcr & 0x80;
+
+    pthread_mutex_lock(&u->lock);
+
+    if (run->io.direction == KVM_EXIT_IO_IN) {          /* guest reads */
+        uint8_t val = 0;
+        switch (reg) {
+        case 0:                                         /* RBR / DLL */
+            if (dlab) val = u->dll;
+            else {
+                val = u->rx_ready ? u->rx_byte : 0;
+                u->rx_ready = 0;
+                uart_update_irq(u);
+            }
+            break;
+        case 1: val = dlab ? u->dlm : u->ier; break;    /* IER / DLM */
+        case 2:                                         /* IIR: why interrupted */
+            if ((u->ier & 0x01) && u->rx_ready)         val = 0x04;
+            else if ((u->ier & 0x02) && u->thre_int) {  val = 0x02; u->thre_int = 0; }
+            else                                        val = 0x01;
+            uart_update_irq(u);
+            break;
+        case 3: val = u->lcr; break;
+        case 4: val = u->mcr; break;
+        case 5: val = 0x60 | (u->rx_ready ? 0x01 : 0); break; /* LSR: THRE|TEMT|DR */
+        case 6: val = 0xb0; break;                      /* MSR: DCD|DSR|CTS */
+        default: val = 0; break;
+        }
+        *data = val;
+    } else {                                            /* guest writes */
+        uint8_t val = *data;
+        switch (reg) {
+        case 0:                                         /* THR / DLL */
+            if (dlab) u->dll = val;
+            else { putchar(val); fflush(stdout); u->thre_int = 1; uart_update_irq(u); }
+            break;
+        case 1:                                         /* IER / DLM */
+            if (dlab) u->dlm = val;
+            else {
+                uint8_t old = u->ier; u->ier = val;
+                if ((val & 0x02) && !(old & 0x02)) u->thre_int = 1;
+                uart_update_irq(u);
+            }
+            break;
+        case 2: u->fcr = val; break;                    /* FCR */
+        case 3: u->lcr = val; break;                    /* LCR */
+        case 4: u->mcr = val; uart_update_irq(u); break;/* MCR (OUT2 may change) */
+        default: break;                                 /* LSR/MSR read-only, etc. */
+        }
+    }
+
+    pthread_mutex_unlock(&u->lock);
+}
+
+/* Blocks on stdin; each byte becomes a guest RX byte + IRQ 4.
+   Runs on its own thread because the vCPU thread is parked in KVM_RUN. */
+static void *input_thread(void *arg) {
+    struct uart *u = arg;
+    uint8_t c;
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n == 0) break;                              /* EOF */
+        if (n < 0) { if (errno == EINTR) continue; break; }
+
+        for (;;) {                                      /* wait for guest to take prev byte */
+            pthread_mutex_lock(&u->lock);
+            if (!u->rx_ready) {
+                u->rx_byte = c;
+                u->rx_ready = 1;
+                uart_update_irq(u);
+                pthread_mutex_unlock(&u->lock);
+                break;
+            }
+            pthread_mutex_unlock(&u->lock);
+            usleep(200);
+        }
+    }
+    return NULL;
+}
+
+/* --- host terminal raw mode so keystrokes reach the guest --- */
+
+static struct termios orig_termios;
+static int termios_saved;
+
+static void restore_termios(void) {
+    if (termios_saved) tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+}
+
+static void setup_termios(void) {
+    if (!isatty(STDIN_FILENO)) return;
+    if (tcgetattr(STDIN_FILENO, &orig_termios) == 0) {
+        termios_saved = 1;
+        struct termios raw = orig_termios;
+        cfmakeraw(&raw);
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+        atexit(restore_termios);
+    }
+}
 
 int main(void) {
-    
-    
 
     // open KVM
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
@@ -48,7 +189,7 @@ int main(void) {
     ret = ioctl(vmfd, KVM_CREATE_IRQCHIP, 0);
     struct kvm_pit_config pit = { .flags = 0 };
     ret = ioctl(vmfd, KVM_CREATE_PIT2, &pit);
-    
+
     // make a vCPU
     int vcpufd = ioctl(vmfd, KVM_CREATE_VCPU, (unsigned long)0);
 
@@ -97,7 +238,7 @@ int main(void) {
 
     // build the boot_params
     fseek(img, 0x1f1, SEEK_SET);
-    
+
     ret = fread(mem + 0x101f1, 1, 0x7b, img);
     if(1L * ret != 0x7b)
         err(1, "fread read less than needed");
@@ -137,7 +278,7 @@ int main(void) {
     if(ret == -1){
         err(1, "Failed to close file");
     }
-    
+
     // set up the VM struct
     struct kvm_userspace_memory_region region = {
         .slot = 0,
@@ -213,7 +354,7 @@ int main(void) {
     sregs.es.dpl = 0;
     sregs.es.limit = 0xffffffff;
     sregs.es.l = 0;
-    
+
     sregs.cr0 |= 0x1;
     sregs.gdt.base = 0x30000;
     sregs.gdt.limit = 0x1f;
@@ -221,20 +362,10 @@ int main(void) {
     if(ret == -1)
         err(1, "KVM_SET_SREGS");
 
-    // right after KVM_SET_SREGS
-    struct kvm_sregs check;
-    ioctl(vcpufd, KVM_GET_SREGS, &check);
-    fprintf(stderr, "after set: CS=0x%x CR0=0x%llx\n", check.cs.selector, check.cr0);
-    fprintf(stderr, "cs: base=0x%llx limit=0x%x g=%d db=%d type=%d present=%d\n",
-    check.cs.base, check.cs.limit, check.cs.g, check.cs.db, check.cs.type, check.cs.present);
-
-    printf("%04x\n", sregs.cr0);
-
     struct kvm_cpuid2 *cpuid = calloc(1, sizeof(struct kvm_cpuid2) + 100 * sizeof(struct kvm_cpuid_entry2));
-cpuid->nent = 100;   // tell KVM: I gave you room for 100 entries
-ret = ioctl(kvm, KVM_GET_SUPPORTED_CPUID, cpuid);   // on the KVM fd, not vmfd!
-if (ret == -1) err(1, "KVM_GET_SUPPORTED_CPUID");
-// now cpuid->nent holds the real count, and cpuid->entries[] is filled
+    cpuid->nent = 100;
+    ret = ioctl(kvm, KVM_GET_SUPPORTED_CPUID, cpuid);   // on the KVM fd, not vmfd!
+    if (ret == -1) err(1, "KVM_GET_SUPPORTED_CPUID");
 
     ret = ioctl(vcpufd, KVM_SET_CPUID2, cpuid);   // on the VCPU fd!
     if (ret == -1) err(1, "KVM_SET_CPUID2");
@@ -251,92 +382,54 @@ if (ret == -1) err(1, "KVM_GET_SUPPORTED_CPUID");
     if(ret == -1)
         err(1, "KVM_SET_REGS");
 
+    /* --- serial: init UART state, raw terminal, spawn input thread --- */
+    memset(&uart, 0, sizeof(uart));
+    pthread_mutex_init(&uart.lock, NULL);
+    uart.vmfd = vmfd;
+    uart.irq_level = -1;             /* force first KVM_IRQ_LINE to take effect */
 
-    struct kvm_regs verify;
-    ioctl(vcpufd, KVM_GET_REGS, &verify);
-    fprintf(stderr, "before run: RIP=0x%llx\n", verify.rip);
+    setup_termios();
+    signal(SIGPIPE, SIG_IGN);
 
+    pthread_t tid;
+    pthread_create(&tid, NULL, input_thread, &uart);
 
-    // right before the while loop
-    unsigned char *p = (unsigned char *)mem + 0x100000;
-    fprintf(stderr, "bytes at 0x100000: %02x %02x %02x %02x\n", p[0], p[1], p[2], p[3]);
     // run the VM
-    int output;
-
-    int iter_counter = 0;
     struct kvm_regs r;
     struct kvm_sregs sr;
-    int pending_byte = -1;
-    char byte;
 
     while(1){
-        
+
         ret = ioctl(vcpufd, KVM_RUN, NULL);
-        if(ret == -1)
+        if(ret == -1){
+            if(errno == EINTR) continue;
             err(1, "KVM_RUN");
+        }
 
         switch(run->exit_reason){
             case KVM_EXIT_HLT:
-                printf("Exit successful\n");
-                
                 ioctl(vcpufd, KVM_GET_REGS, &r);
                 ioctl(vcpufd, KVM_GET_SREGS, &sr);
-                fprintf(stderr, "ON EXIT : RIP=0x%llx CS=0x%x CR0=0x%llx\n", r.rip, sr.cs.selector, sr.cr0);
-                printf("Number of iterations : %d\n", iter_counter);
-
-                // in the HLT case, before returning:
-                unsigned char *hp = (unsigned char *)mem + r.rip;
-                fprintf(stderr, "bytes at halt RIP: %02x %02x %02x %02x\n", hp[0], hp[1], hp[2], hp[3]);
-
+                fprintf(stderr, "\r\nHLT: RIP=0x%llx CS=0x%x CR0=0x%llx\r\n",
+                        r.rip, sr.cs.selector, sr.cr0);
                 return 0;
-                break;
             case KVM_EXIT_IO:
-                //fprintf(stderr, "IO port=0x%x dir=%d\n", run->io.port, run->io.direction);
-                output = *(unsigned char *)(((char *)run) + run->io.data_offset);
-
-                
-
-                if(run->io.port == 0x3fd && run->io.direction == KVM_EXIT_IO_IN){
-                    //fprintf(stderr, "[LSR read]\n");        // ← add this
-                    if(pending_byte < 0){
-                        if( read(STDIN_FILENO, &byte, 1) > 0){
-                            *((char*)run + run->io.data_offset) = 0x61;
-                            pending_byte = 1;
-                        }
-                    }
-                    *((char*)run + run->io.data_offset) = (pending_byte == 1) ? 0x61 : 0x60;
-                }
-
-                if(run->io.port == 0x3f8 && run->io.direction == KVM_EXIT_IO_OUT){
-                    putchar(output);
-                    fflush(stdout);
-                }
-
-                if(run->io.port == 0x3f8 && run->io.direction == KVM_EXIT_IO_IN && pending_byte == 1){
-                    fprintf(stderr, "[DATA read]\n");       // ← add this
-                    *((char*)run + run->io.data_offset) = byte;
-                    pending_byte = -1;
-                }
+                if(run->io.port >= COM1_BASE && run->io.port <= COM1_BASE + 7)
+                    uart_io(&uart, run);
                 break;
             case KVM_EXIT_MMIO:
-                if(!run->mmio.is_write){
+                if(!run->mmio.is_write)
                     *run->mmio.data = 0;
-                }
                 break;
             default:
-                printf("unexpected exit reason: %d\n", run->exit_reason);
+                fprintf(stderr, "\r\nunexpected exit reason: %d\r\n", run->exit_reason);
                 ioctl(vcpufd, KVM_GET_REGS, &r);
                 ioctl(vcpufd, KVM_GET_SREGS, &sr);
-                fprintf(stderr, "RIP=0x%llx CS=0x%x CR0=0x%llx\n", r.rip, sr.cs.selector, sr.cr0);
-                printf("Number of iterations : %d\n", iter_counter);
-                
+                fprintf(stderr, "RIP=0x%llx CS=0x%x CR0=0x%llx\r\n",
+                        r.rip, sr.cs.selector, sr.cr0);
                 return 1;
-                break;
         }
-        iter_counter++;
     }
-
-    printf("Number of iterations : %d\n", iter_counter);
 
     return 0;
 }
